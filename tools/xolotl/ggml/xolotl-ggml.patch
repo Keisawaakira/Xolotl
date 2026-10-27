@@ -1,8 +1,8 @@
 diff --git i/ggml/include/ggml-cuda.h w/ggml/include/ggml-cuda.h
-index 1cd81eeae..516aaccd5 100644
+index 1cd81eeae..d2cf3a3c7 100644
 --- i/ggml/include/ggml-cuda.h
 +++ w/ggml/include/ggml-cuda.h
-@@ -24,6 +24,14 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+@@ -24,6 +24,18 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
  
  GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
  
@@ -13,6 +13,10 @@ index 1cd81eeae..516aaccd5 100644
 +// "ds4_moe: chunk sync: an illegal memory access was encountered" and a SIGSEGV in ggml_backend_cuda_graph_compute.
 +// Call this before freeing the context.  No-op when the backend is not CUDA.
 +GGML_BACKEND_API void ggml_backend_cuda_graph_cache_clear(ggml_backend_t backend);
++
++// xolotl: the backend's main stream (a cudaStream_t), so work outside ggml can wait for its graphs or make it wait.
++// Every graph ends on this stream (concurrent branches join back to it).  NULL when the backend is not CUDA.
++GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
 +
  // device buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
@@ -1087,7 +1091,7 @@ index 3c5bea5f4..89e759fb2 100644
 +
 +void ggml_cuda_op_dsv41_kv_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git i/ggml/src/ggml-cuda/ggml-cuda.cu w/ggml/src/ggml-cuda/ggml-cuda.cu
-index a9038f1f4..7980e9c67 100644
+index a9038f1f4..26cfefd6f 100644
 --- i/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ w/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2391,6 +2391,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
@@ -1135,7 +1139,7 @@ index a9038f1f4..7980e9c67 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -4797,6 +4821,21 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+@@ -4797,6 +4821,29 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
  }
  
@@ -1154,10 +1158,18 @@ index a9038f1f4..7980e9c67 100644
 +#endif
 +}
 +
++void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return nullptr;
++    }
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    return (void *) ctx->stream(ctx->device, 0);
++}
++
  int ggml_backend_cuda_get_device_count() {
      return ggml_cuda_info().device_count;
  }
-@@ -5209,6 +5248,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5209,6 +5256,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -1165,7 +1177,7 @@ index a9038f1f4..7980e9c67 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5226,7 +5266,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5226,7 +5274,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -1175,7 +1187,7 @@ index a9038f1f4..7980e9c67 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -5499,6 +5540,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5499,6 +5548,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
