@@ -17,10 +17,10 @@ index 1cd81eeae..516aaccd5 100644
  // device buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
  
-diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+diff --git i/ggml/include/ggml.h w/ggml/include/ggml.h
 index 224bdef92..3eec1413a 100644
---- a/ggml/include/ggml.h
-+++ b/ggml/include/ggml.h
+--- i/ggml/include/ggml.h
++++ w/ggml/include/ggml.h
 @@ -585,6 +585,8 @@ extern "C" {
          GGML_OP_DSV4_HC_COMB,
          GGML_OP_DSV4_HC_PRE,
@@ -113,10 +113,10 @@ index 8bb0ff7bc..dd97d59a3 100644
              {
                  n_tasks = n_threads;
              } break;
-diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+diff --git i/ggml/src/ggml-cpu/ops.cpp w/ggml/src/ggml-cpu/ops.cpp
 index ba00a0a73..1078b52d0 100644
---- a/ggml/src/ggml-cpu/ops.cpp
-+++ b/ggml/src/ggml-cpu/ops.cpp
+--- i/ggml/src/ggml-cpu/ops.cpp
++++ w/ggml/src/ggml-cpu/ops.cpp
 @@ -12135,7 +12135,7 @@ void ggml_compute_forward_lightning_indexer(
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
      GGML_ASSERT(   q->type == GGML_TYPE_F32);
@@ -862,10 +862,10 @@ index a9038f1f4..a462357be 100644
          case GGML_OP_FLASH_ATTN_EXT:
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_CROSS_ENTROPY_LOSS:
-diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+diff --git i/ggml/src/ggml-cuda/lightning-indexer.cu w/ggml/src/ggml-cuda/lightning-indexer.cu
 index 5edc967e0..24c2a4e18 100644
---- a/ggml/src/ggml-cuda/lightning-indexer.cu
-+++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+--- i/ggml/src/ggml-cuda/lightning-indexer.cu
++++ w/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -3,6 +3,18 @@
  #include "fattn-common.cuh"
  #include "convert.cuh"
@@ -1468,10 +1468,149 @@ index 465997065..57cdad285 100644
      } else {
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
-diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+diff --git i/ggml/src/ggml-cuda/top-k.cu w/ggml/src/ggml-cuda/top-k.cu
+index c7a0c8317..1d50b8125 100644
+--- i/ggml/src/ggml-cuda/top-k.cu
++++ w/ggml/src/ggml-cuda/top-k.cu
+@@ -48,7 +48,7 @@ static int next_power_of_2(int x) {
+ 
+ #endif                            // CUB_TOP_K_AVAILABLE
+ 
+-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
++#if defined(CUB_TOP_K_AVAILABLE) || (!defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP))
+ 
+ static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
+     const uint32_t bits = __float_as_uint(value);
+@@ -146,7 +146,7 @@ static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, in
+     }
+ }
+ 
+-template<int BLOCK_SIZE>
++template<int BLOCK_SIZE, bool EQUAL = true>
+ static __global__ void top_k_radix_gather(
+         const float * __restrict__ src,
+         int * __restrict__ dst,
+@@ -168,7 +168,7 @@ static __global__ void top_k_radix_gather(
+         if (key > state->prefix) {
+             const int pos = atomicAdd(&state->greater_count, 1);
+             row_dst[pos] = col;
+-        } else if (key == state->prefix) {
++        } else if (EQUAL && key == state->prefix) {
+             const int pos = atomicAdd(&state->equal_count, 1);
+             if (pos < state->rank) {
+                 row_dst[k - state->rank + pos] = col;
+@@ -177,6 +177,50 @@ static __global__ void top_k_radix_gather(
+     }
+ }
+ 
++#ifdef CUB_TOP_K_AVAILABLE
++// xolotl: the keys equal to the k-th value, one block per row in column order - ties go to the lowest columns, the same every run
++template<int BLOCK_SIZE>
++static __global__ void top_k_radix_gather_equal(
++        const float * __restrict__ src,
++        int * __restrict__ dst,
++        const top_k_radix_state * __restrict__ states,
++        int ncols,
++        int k) {
++    constexpr int NW = BLOCK_SIZE / WARP_SIZE;
++    __shared__ int warp_n[NW];
++
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int lane = tid % WARP_SIZE;
++    const int warp = tid / WARP_SIZE;
++    const top_k_radix_state state = states[row];
++    const float * row_src = src + (size_t) row * ncols;
++    int * row_dst = dst + (size_t) row * k + (k - state.rank);
++
++    int base = 0;
++    for (int col0 = 0; col0 < ncols && base < state.rank; col0 += BLOCK_SIZE) {
++        const int col = col0 + tid;
++        const bool eq = col < ncols && top_k_float_to_ordered(row_src[col]) == state.prefix;
++        const unsigned mask = __ballot_sync(0xffffffff, eq);
++        if (lane == 0) {
++            warp_n[warp] = __popc(mask);
++        }
++        __syncthreads();
++        int pos = base + __popc(mask & ((1u << lane) - 1));
++        int tile_n = 0;
++        for (int w = 0; w < NW; ++w) {
++            pos += w < warp ? warp_n[w] : 0;
++            tile_n += warp_n[w];
++        }
++        if (eq && pos < state.rank) {
++            row_dst[pos] = col;
++        }
++        base += tile_n;
++        __syncthreads();
++    }
++}
++#endif // CUB_TOP_K_AVAILABLE
++
+ static void top_k_radix_cuda(
+         ggml_cuda_pool & pool,
+         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+@@ -203,12 +247,20 @@ static void top_k_radix_cuda(
+ 
+     top_k_radix_reset_counters
+         <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
++#ifdef CUB_TOP_K_AVAILABLE
++    top_k_radix_gather<BLOCK_SIZE, false>
++        <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++            src, dst, states, ncols, k, blocks_per_row);
++    top_k_radix_gather_equal<BLOCK_SIZE>
++        <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
++#else
+     top_k_radix_gather<BLOCK_SIZE>
+         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+             src, dst, states, ncols, k, blocks_per_row);
++#endif // CUB_TOP_K_AVAILABLE
+ }
+ 
+-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
++#endif // defined(CUB_TOP_K_AVAILABLE) || (!defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP))
+ 
+ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0   = dst->src[0];
+@@ -226,6 +278,21 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t    k     = dst->ne[0];
+     ggml_cuda_pool & pool  = ctx.pool();
+ #ifdef CUB_TOP_K_AVAILABLE
++    // xolotl: many rows in one call (radix select, or bitonic argsort up to 1024 cols) - one CUB call per row is launch-bound in long prompts
++    // GGML_CUDA_TOPK_PER_ROW=1: always one CUB call per row
++    static const bool per_row = getenv("GGML_CUDA_TOPK_PER_ROW") && atoi(getenv("GGML_CUDA_TOPK_PER_ROW")) == 1;
++    if (!per_row && nrows >= 16) {
++        if (ncols > 1024) {
++            top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
++        } else {
++            ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
++            int *                     tmp_dst = temp_dst_alloc.get();
++            argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
++            CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
++                                         cudaMemcpyDeviceToDevice, stream));
++        }
++        return;
++    }
+     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
+     // https://github.com/NVIDIA/cccl/issues/6391
+     // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
+diff --git i/ggml/src/ggml-vulkan/ggml-vulkan.cpp w/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index da0e24fcd..50eda05e2 100644
+--- i/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ w/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15403,7 +15403,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+ 
+                 // the q/w/m types and the shape relationships between q, k, w, m and dst
+                 // are already asserted in ggml_lightning_indexer()
+-                if (!ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
++                if (m->type != GGML_TYPE_F16 || !ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
+                     return false;
+                 }
+ 
+diff --git i/ggml/src/ggml.c w/ggml/src/ggml.c
 index 175281409..d05702f7b 100644
---- a/ggml/src/ggml.c
-+++ b/ggml/src/ggml.c
+--- i/ggml/src/ggml.c
++++ w/ggml/src/ggml.c
 @@ -1084,6 +1084,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_COMB",
      "DSV4_HC_PRE",
@@ -1573,16 +1712,3 @@ index 175281409..d05702f7b 100644
  struct ggml_tensor * ggml_dsv4_hc_pre(
          struct ggml_context * ctx,
          struct ggml_tensor  * x,
-diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index da0e24fcd..50eda05e2 100644
---- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-+++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -15403,7 +15403,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
- 
-                 // the q/w/m types and the shape relationships between q, k, w, m and dst
-                 // are already asserted in ggml_lightning_indexer()
--                if (!ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
-+                if (m->type != GGML_TYPE_F16 || !ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
-                     return false;
-                 }
- 
