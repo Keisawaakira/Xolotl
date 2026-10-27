@@ -456,7 +456,10 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         if (l < 0) return true;
         return l >= im.layer_lo && l < im.layer_hi;
     };
-    auto skip = [&](const std::string & n) { return is_routed(n) || n == "token_embd.weight" || !in_dense_range(n); };
+    // (per_layer_token_embd.weight = the Engram tables of a llama.cpp GGUF that holds them, Unsloth's: ds41_engram reads them)
+    auto skip = [&](const std::string & n) {
+        return is_routed(n) || n == "token_embd.weight" || n == "per_layer_token_embd.weight" || !in_dense_range(n);
+    };
     if (im.cpu) {
         for (size_t s = 0; s < model.size(); ++s) {
             const GgufFile & sh = model.shard(s);
