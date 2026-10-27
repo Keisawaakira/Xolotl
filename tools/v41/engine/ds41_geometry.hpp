@@ -513,7 +513,9 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
         }
         add(b + "ffn_gate_inp.weight", { D, NE }, ty::F32);
         add(b + "exp_probs_b.bias", { NE }, ty::F32);
-        if (!lc) add(b + "exp_probs_b_vl.bias", { NE }, ty::F32);   // (vision only; absent in the llama.cpp convention)
+        // (vision only; absent in the llama.cpp convention - unless added back, as K:/model/test/vision/make_vl_gguf.py
+        // does for ISTA-DASLab's GSQ-RCO GGUFs: then it is checked like ours.  A file without it is unchanged.)
+        if (!lc || m.find(b + "exp_probs_b_vl.bias")) add(b + "exp_probs_b_vl.bias", { NE }, ty::F32);
         add(b + "ffn_gate_shexp.weight", { D, FF }, ty::Q8_0);
         add(b + "ffn_up_shexp.weight", { D, FF }, ty::Q8_0);
         add(b + "ffn_down_shexp.weight", { FF, D }, ty::Q8_0);
