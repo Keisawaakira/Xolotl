@@ -18,20 +18,21 @@ index 1cd81eeae..516aaccd5 100644
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
  
 diff --git i/ggml/include/ggml.h w/ggml/include/ggml.h
-index 224bdef92..9ec5f8a1c 100644
+index 224bdef92..6f2f3fe09 100644
 --- i/ggml/include/ggml.h
 +++ w/ggml/include/ggml.h
-@@ -585,6 +585,9 @@ extern "C" {
+@@ -585,6 +585,10 @@ extern "C" {
          GGML_OP_DSV4_HC_COMB,
          GGML_OP_DSV4_HC_PRE,
          GGML_OP_DSV4_HC_POST,
 +        GGML_OP_DSV41_FAKE_QUANT,
 +        GGML_OP_DSV41_HC_MIXES,
 +        GGML_OP_DSV41_KV_GATHER,
++        GGML_OP_DSV41_ROUTE,
  
          GGML_OP_UNARY,
  
-@@ -2664,7 +2667,8 @@ extern "C" {
+@@ -2664,7 +2668,8 @@ extern "C" {
      // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
      // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
      // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
@@ -41,7 +42,7 @@ index 224bdef92..9ec5f8a1c 100644
      // res:     [n_kv,       n_batch,    1,       ne3 ]
      //
      // broadcast:
-@@ -2726,6 +2730,42 @@ extern "C" {
+@@ -2726,6 +2731,59 @@ extern "C" {
              struct ggml_tensor  * post,
              struct ggml_tensor  * comb);
  
@@ -81,14 +82,31 @@ index 224bdef92..9ec5f8a1c 100644
 +            struct ggml_tensor  * ib,
 +            int                   pad);
 +
++    // Strata-DS4: a DeepSeek-V4 router's selection in ONE op (CUDA only), the values of the stock-op chain bit for bit:
++    // s = sqrt(softplus(logits)), the top k of (s + b0) + b1 (value desc, equal values by ascending column, as
++    // ggml_argsort_top_k's CUDA kernels), the weights s[ids], / (sum + 1e-20) when norm, * scale.
++    //   logits: F32 [ne, n], contiguous rows, ne <= 1024   b0, b1: F32 [ne]   1 <= k <= 32
++    //   ids: I32 [k, n] destination or NULL (a new tensor)   wts: F32 [k, n] destination or NULL (no weights)
++    //   result: the ids (a view of ids when given); wts is written as a second output
++    GGML_API struct ggml_tensor * ggml_dsv41_route(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * logits,
++            struct ggml_tensor  * b0,
++            struct ggml_tensor  * b1,
++            struct ggml_tensor  * ids,
++            struct ggml_tensor  * wts,
++            int                   k,
++            bool                  norm,
++            float                 scale);
++
      // custom operators
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
 diff --git i/ggml/src/ggml-backend-meta.cpp w/ggml/src/ggml-backend-meta.cpp
-index 3ec40fb1a..3f3a21832 100644
+index 3ec40fb1a..a8a89eaeb 100644
 --- i/ggml/src/ggml-backend-meta.cpp
 +++ w/ggml/src/ggml-backend-meta.cpp
-@@ -1037,7 +1037,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1037,7 +1037,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              } break;
              case GGML_OP_DSV4_HC_COMB:
              case GGML_OP_DSV4_HC_PRE:
@@ -96,15 +114,16 @@ index 3ec40fb1a..3f3a21832 100644
 +            case GGML_OP_DSV4_HC_POST:
 +            case GGML_OP_DSV41_FAKE_QUANT:
 +            case GGML_OP_DSV41_HC_MIXES:
-+            case GGML_OP_DSV41_KV_GATHER: {
++            case GGML_OP_DSV41_KV_GATHER:
++            case GGML_OP_DSV41_ROUTE: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
              case GGML_OP_UNARY: {
 diff --git i/ggml/src/ggml-cpu/ggml-cpu.c w/ggml/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7bc..ebf235953 100644
+index 8bb0ff7bc..c74587e1f 100644
 --- i/ggml/src/ggml-cpu/ggml-cpu.c
 +++ w/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2109,6 +2109,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2109,6 +2109,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_dsv4_hc_post(params, tensor);
              } break;
@@ -120,10 +139,14 @@ index 8bb0ff7bc..ebf235953 100644
 +            {
 +                GGML_ABORT("DSV41_KV_GATHER is CUDA only");
 +            } break;
++        case GGML_OP_DSV41_ROUTE:
++            {
++                GGML_ABORT("DSV41_ROUTE is CUDA only");
++            } break;
          case GGML_OP_MAP_CUSTOM1:
              {
                  ggml_compute_forward_map_custom1(params, tensor);
-@@ -2292,9 +2304,15 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2292,9 +2308,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_DSV4_HC_COMB:
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
@@ -133,6 +156,7 @@ index 8bb0ff7bc..ebf235953 100644
                  n_tasks = n_threads;
              } break;
 +        case GGML_OP_DSV41_KV_GATHER:
++        case GGML_OP_DSV41_ROUTE:
 +            {
 +                n_tasks = 1;
 +            } break;
@@ -140,14 +164,15 @@ index 8bb0ff7bc..ebf235953 100644
          case GGML_OP_REPEAT_BACK:
          case GGML_OP_LEAKY_RELU:
 diff --git i/ggml/src/ggml-cpu/ggml-cpu.cpp w/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 1df0f2bb9..d40bbbb48 100644
+index 1df0f2bb9..9e5f4f67b 100644
 --- i/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ w/ggml/src/ggml-cpu/ggml-cpu.cpp
-@@ -440,6 +440,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+@@ -440,6 +440,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
      }
  
      switch (op->op) {
 +        case GGML_OP_DSV41_KV_GATHER:
++        case GGML_OP_DSV41_ROUTE:
 +            return false;   // CUDA only
          case GGML_OP_CPY:
          case GGML_OP_SET_ROWS:
@@ -291,7 +316,7 @@ index 2728b08b6..a3edb34fb 100644
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git i/ggml/src/ggml-cuda/argsort.cu w/ggml/src/ggml-cuda/argsort.cu
-index 24115da09..3f7bf1fbd 100644
+index 24115da09..129ac46fa 100644
 --- i/ggml/src/ggml-cuda/argsort.cu
 +++ w/ggml/src/ggml-cuda/argsort.cu
 @@ -216,6 +216,143 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
@@ -459,6 +484,144 @@ index 24115da09..3f7bf1fbd 100644
  #ifdef GGML_CUDA_USE_CUB
      const int    ncols_pad      = next_power_of_2(ncols);
      const size_t shared_mem     = ncols_pad * sizeof(int);
+@@ -293,3 +444,124 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     argsort_f32_i32_cuda_bitonic(src0_d, (int *) dst_d, ncols, nrows, order, stream);
+ #endif
+ }
++
++// Strata-DS4 (ggml_dsv41_route): a DeepSeek-V4 router with the stock chain's values bit for bit.  One block per
++// row: each thread scores one column - s = sqrt(softplus(x)) as unary.cu's op_softplus / op_sqrt, the selection key
++// of (s + b0) + b1 as k_argsort_topk_warp_f32_i32's - then warp 0 takes the first k (value desc, equal values by
++// ascending column), sums the weights s[ids] as sum_rows does (warp_reduce_sum, weight j in lane j) and writes
++// w / (1 * sum + 1e-20) as ggml_div and scale * w + 0 as scale_f32.  Replaces softplus, sqrt, 2 adds, the top-k,
++// get_rows, sum_rows, scale_bias, div and scale.
++static __device__ __forceinline__ unsigned long long dsv41_route_warp_min(unsigned long long v) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
++    const unsigned hi = __reduce_min_sync(0xFFFFFFFFu, (unsigned) (v >> 32));
++    const unsigned lo = __reduce_min_sync(0xFFFFFFFFu, (unsigned) (v >> 32) == hi ? (unsigned) v : 0xFFFFFFFFu);
++    return ((unsigned long long) hi << 32) | lo;
++#else
++#pragma unroll
++    for (int off = 16; off > 0; off >>= 1) {
++        const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, v, off);
++        v = o < v ? o : v;
++    }
++    return v;
++#endif
++}
++
++template<int NPL>   // NPL: columns per lane in the selection, >= ceil(ncols / 32)
++static __global__ void k_dsv41_route(const float * x, const float * b0, const float * b1, int * ids, float * wts,
++                                     const int ncols, const int k, const int64_t sx, const int64_t sids,
++                                     const int64_t swts, const int norm, const float scale) {
++    ggml_cuda_pdl_lc();
++    __shared__ unsigned s_key[32 * NPL];
++    __shared__ float    s_val[32 * NPL];
++    const int64_t row = blockIdx.x;
++    const int c = threadIdx.x;
++    float bias0 = 0.0f, bias1 = 0.0f;
++    if (c < ncols) {
++        bias0 = b0[c];
++        bias1 = b1[c];
++    }
++    ggml_cuda_pdl_sync();
++    if (c < ncols) {
++        const float xv = x[row * sx + c];
++        const float sp = (xv > 20.0f) ? xv : logf(1.0f + expf(xv));
++        const float s  = sqrtf(sp);
++        const float v  = (s + bias0) + bias1;
++        const unsigned u = __float_as_uint(v);
++        s_key[c] = ~((u & 0x80000000u) ? ~u : (u | 0x80000000u));   // descending
++        s_val[c] = s;
++    }
++    __syncthreads();
++    if (threadIdx.x >= 32) {
++        return;
++    }
++    const int lane = threadIdx.x;
++    unsigned long long key[NPL];
++    unsigned long long best = ~0ull;
++#pragma unroll
++    for (int i = 0; i < NPL; ++i) {
++        const int cc = lane + 32 * i;
++        key[i] = cc < ncols ? (((unsigned long long) s_key[cc] << 32) | (unsigned) cc) : ~0ull;   // padding: last
++        best = key[i] < best ? key[i] : best;
++    }
++    int * ids_row = ids + row * sids;
++    float w = 0.0f;   // lane j: the j-th pick's s
++    for (int j = 0; j < k; ++j) {
++        const unsigned long long m = dsv41_route_warp_min(best);
++        const int col = (int) (m & 0xFFFFFFFFull);
++        if (lane == j) {
++            w = s_val[col];
++        }
++        if (lane == 0) {
++            ids_row[j] = col;
++        }
++        if (lane == (col & 31)) {   // the winner drops that column and rescans its own
++            best = ~0ull;
++#pragma unroll
++            for (int i = 0; i < NPL; ++i) {
++                if (i == (col >> 5)) {
++                    key[i] = ~0ull;
++                }
++                best = key[i] < best ? key[i] : best;
++            }
++        }
++    }
++    if (wts == nullptr) {
++        return;
++    }
++    float q = w;
++    if (norm) {
++        const float sum = warp_reduce_sum(w);
++        q = w / (1.0f * sum + 1e-20f);
++    }
++    if (lane < k) {
++        wts[row * swts + lane] = scale * q + 0.0f;
++    }
++}
++
++void ggml_cuda_op_dsv41_route(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x  = dst->src[0];
++    const ggml_tensor * b0 = dst->src[1];
++    const ggml_tensor * b1 = dst->src[2];
++    const ggml_tensor * wt = dst->src[4];
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && b0->type == GGML_TYPE_F32 && b1->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_I32 && (!wt || wt->type == GGML_TYPE_F32));
++    const int   k     = ggml_get_op_params_i32(dst, 0);
++    const int   norm  = ggml_get_op_params_i32(dst, 1);
++    const float scale = ggml_get_op_params_f32(dst, 2);
++    const int ncols = (int) x->ne[0];
++    const int nrows = (int) x->ne[1];
++    const int64_t sx   = x->nb[1] / sizeof(float);
++    const int64_t sids = dst->nb[1] / sizeof(int32_t);
++    const int64_t swts = wt ? wt->nb[1] / sizeof(float) : 0;
++    const float * x_d  = (const float *) x->data;
++    const float * b0_d = (const float *) b0->data;
++    const float * b1_d = (const float *) b1->data;
++    int *   ids_d = (int *) dst->data;
++    float * wts_d = wt ? (float *) wt->data : nullptr;
++    const int npl = (ncols + 31) / 32;
++    const ggml_cuda_kernel_launch_params params(dim3(nrows, 1, 1), dim3(32 * npl, 1, 1), 0, ctx.stream());
++#define ROUTE_NPL(N) if (npl <= N) { ggml_cuda_kernel_launch(k_dsv41_route<N>, params, x_d, b0_d, b1_d, ids_d, wts_d, ncols, k, sx, sids, swts, norm, scale); return; }
++    ROUTE_NPL(1) ROUTE_NPL(2) ROUTE_NPL(4) ROUTE_NPL(8) ROUTE_NPL(12) ROUTE_NPL(16) ROUTE_NPL(24) ROUTE_NPL(32)
++#undef ROUTE_NPL
++    GGML_ABORT("fatal error");
++}
+diff --git i/ggml/src/ggml-cuda/argsort.cuh w/ggml/src/ggml-cuda/argsort.cuh
+index 3abb6448a..ec19385ce 100644
+--- i/ggml/src/ggml-cuda/argsort.cuh
++++ w/ggml/src/ggml-cuda/argsort.cuh
+@@ -2,6 +2,8 @@
+ 
+ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++void ggml_cuda_op_dsv41_route(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
+ #ifdef GGML_CUDA_USE_CUB
+ int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows);
+ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
 diff --git i/ggml/src/ggml-cuda/cpy-utils.cuh w/ggml/src/ggml-cuda/cpy-utils.cuh
 index 7697c292d..f98b32a81 100644
 --- i/ggml/src/ggml-cuda/cpy-utils.cuh
@@ -924,10 +1087,10 @@ index 3c5bea5f4..89e759fb2 100644
 +
 +void ggml_cuda_op_dsv41_kv_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git i/ggml/src/ggml-cuda/ggml-cuda.cu w/ggml/src/ggml-cuda/ggml-cuda.cu
-index a9038f1f4..a51e6715d 100644
+index a9038f1f4..7980e9c67 100644
 --- i/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ w/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2391,6 +2391,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2391,6 +2391,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -940,10 +1103,13 @@ index a9038f1f4..a51e6715d 100644
 +        case GGML_OP_DSV41_KV_GATHER:
 +            ggml_cuda_op_dsv41_kv_gather(ctx, dst);
 +            break;
++        case GGML_OP_DSV41_ROUTE:
++            ggml_cuda_op_dsv41_route(ctx, dst);
++            break;
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -2560,6 +2569,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2560,6 +2572,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
@@ -956,7 +1122,7 @@ index a9038f1f4..a51e6715d 100644
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
  
-@@ -2567,6 +2582,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2567,6 +2585,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
              continue;
          }
  
@@ -969,7 +1135,7 @@ index a9038f1f4..a51e6715d 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -4797,6 +4818,21 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+@@ -4797,6 +4821,21 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
  }
  
@@ -991,7 +1157,7 @@ index a9038f1f4..a51e6715d 100644
  int ggml_backend_cuda_get_device_count() {
      return ggml_cuda_info().device_count;
  }
-@@ -5209,6 +5245,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5209,6 +5248,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -999,7 +1165,7 @@ index a9038f1f4..a51e6715d 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5226,7 +5263,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5226,7 +5266,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -1009,7 +1175,7 @@ index a9038f1f4..a51e6715d 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -5499,6 +5537,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5499,6 +5540,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -1024,6 +1190,9 @@ index a9038f1f4..a51e6715d 100644
 +                 (op->src[2]->type == GGML_TYPE_NVFP4 && op->src[2]->ne[0] % QK_K == 0)) &&
 +                op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && op->src[2]->nb[0] == ggml_type_size(op->src[2]->type) &&
 +                op->type == GGML_TYPE_F16 && ggml_is_contiguous(op);
++        case GGML_OP_DSV41_ROUTE:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) && op->src[0]->ne[0] <= 1024 &&
++                op->op_params[0] >= 1 && op->op_params[0] <= 32;
          case GGML_OP_FLASH_ATTN_EXT:
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -1773,48 +1942,50 @@ index da0e24fcd..50eda05e2 100644
                  }
  
 diff --git i/ggml/src/ggml.c w/ggml/src/ggml.c
-index 175281409..bfa4a2c21 100644
+index 175281409..5786c9e38 100644
 --- i/ggml/src/ggml.c
 +++ w/ggml/src/ggml.c
-@@ -1084,6 +1084,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1084,6 +1084,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_COMB",
      "DSV4_HC_PRE",
      "DSV4_HC_POST",
 +    "DSV41_FAKE_QUANT",
 +    "DSV41_HC_MIXES",
 +    "DSV41_KV_GATHER",
++    "DSV41_ROUTE",
  
      "UNARY",
  
-@@ -1101,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1101,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "GLU",
  };
  
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1199,6 +1202,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1199,6 +1203,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "dsv4_hc_comb(mixes, scale, base)",
      "dsv4_hc_pre(x, weights)",
      "dsv4_hc_post(x, residual, post, comb)",
 +    "dsv41_fake_quant(x)",
 +    "dsv41_hc_mixes(mixes, scale, base)",
 +    "dsv41_kv_gather(a, ia, b, ib)",
++    "dsv41_route(logits, b0, b1)",
  
      "unary(x)",
  
-@@ -1216,7 +1222,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1216,7 +1224,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "glu(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5445,6 +5451,9 @@ struct ggml_tensor * ggml_argsort_top_k(
+@@ -5445,6 +5453,9 @@ struct ggml_tensor * ggml_argsort_top_k(
      GGML_ASSERT(a->ne[0] >= k);
  
      struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
@@ -1824,7 +1995,7 @@ index 175281409..bfa4a2c21 100644
  
      result = ggml_view_4d(ctx, result,
                  k, result->ne[1], result->ne[2], result->ne[3],
-@@ -6429,9 +6438,9 @@ struct ggml_tensor * ggml_lightning_indexer(
+@@ -6429,9 +6440,9 @@ struct ggml_tensor * ggml_lightning_indexer(
  
      GGML_ASSERT(       q->type == GGML_TYPE_F32);
      GGML_ASSERT( weights->type == GGML_TYPE_F32);
@@ -1836,7 +2007,7 @@ index 175281409..bfa4a2c21 100644
      GGML_ASSERT(      q->ne[1] == weights->ne[0]);
      GGML_ASSERT(      k->ne[1] == 1);
      GGML_ASSERT(   mask->ne[1] == q->ne[2]);
-@@ -6545,6 +6554,63 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
+@@ -6545,6 +6556,94 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
      return result;
  }
  
@@ -1894,6 +2065,37 @@ index 175281409..bfa4a2c21 100644
 +    result->src[1] = ia;
 +    result->src[2] = b;
 +    result->src[3] = ib;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_route(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * logits,
++        struct ggml_tensor  * b0,
++        struct ggml_tensor  * b1,
++        struct ggml_tensor  * ids,
++        struct ggml_tensor  * wts,
++        int                   k,
++        bool                  norm,
++        float                 scale) {
++    GGML_ASSERT(logits->type == GGML_TYPE_F32 && b0->type == GGML_TYPE_F32 && b1->type == GGML_TYPE_F32);
++    GGML_ASSERT(logits->nb[0] == sizeof(float) && logits->ne[2] == 1 && logits->ne[3] == 1);
++    GGML_ASSERT(ggml_is_contiguous(b0) && ggml_is_contiguous(b1));
++    GGML_ASSERT(ggml_nelements(b0) == logits->ne[0] && ggml_nelements(b1) == logits->ne[0]);
++    GGML_ASSERT(k >= 1 && k <= 32 && k <= logits->ne[0] && logits->ne[0] <= 1024);
++    const int64_t n = logits->ne[1];
++    GGML_ASSERT(!ids || (ids->type == GGML_TYPE_I32 && ids->ne[0] == k && ids->ne[1] == n && ids->nb[0] == sizeof(int32_t)));
++    GGML_ASSERT(!wts || (wts->type == GGML_TYPE_F32 && wts->ne[0] == k && wts->ne[1] == n && wts->nb[0] == sizeof(float)));
++    struct ggml_tensor * result = ids ? ggml_view_tensor(ctx, ids) : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n);
++    ggml_set_op_params_i32(result, 0, k);
++    ggml_set_op_params_i32(result, 1, norm ? 1 : 0);
++    ggml_set_op_params_f32(result, 2, scale);
++    result->op     = GGML_OP_DSV41_ROUTE;
++    result->src[0] = logits;
++    result->src[1] = b0;
++    result->src[2] = b1;
++    result->src[3] = ids;
++    result->src[4] = wts;
 +    return result;
 +}
 +

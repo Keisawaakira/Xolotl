@@ -60,6 +60,16 @@ bool wide_prompt() {
     return on;
 }
 
+// STRATA_ROUTE_FUSE=1 (opt-in, CUDA; DeepInfer's mega_gate idea without its gate GEMM): the router's softplus .. top-k
+// .. weights, and each routing prediction's softplus .. top 16, as ONE op (ggml_dsv41_route) instead of ten / four
+// kernels - the same ids and weights bit for bit.  Off under GGML_CUDA_RANK_ARGSORT=0 (the bitonic kernel then orders
+// equal scores by its wiring, the fused op by column).
+bool route_fuse() {
+    static const bool on = env_on("STRATA_ROUTE_FUSE", false) &&
+                           !(std::getenv("GGML_CUDA_RANK_ARGSORT") && std::getenv("GGML_CUDA_RANK_ARGSORT")[0] == '0');
+    return on;
+}
+
 // The decode graphs are built once and reused; stamping a uid lets ggml-cuda reuse its captured CUDA graph.  One
 // allocator serves every cached graph (they run one at a time); when it has to grow, every graph allocated before
 // is re-allocated on its next use (the epoch), as tools/ds4/ds4_dense.cpp alloc_graph does.
@@ -1444,8 +1454,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         outs.push_back(ggml_cpy(gc, se, b.cols2(im.shexp, D, n, col0)));
     }
     outs.push_back(ggml_cpy(gc, fn, b.cols2(im.o_fn, D, n, col0)));
-    outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
-    outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0)));
+    // STRATA_ROUTE_FUSE: the plain flat-bias selection only (vision rows and the smart / margin bias build theirs above)
+    if (route_fuse() && !im.cpu && bias_sel == im.BL(il, "exp_probs_b.bias") && !smart_router() && rb_margin < 0.0f) {
+        outs.push_back(ggml_dsv41_route(gc, rl, bias_sel, rb, b.cols2(im.o_ids, im.NU, n, col0),
+                                        b.cols2(im.o_wts, im.NU, n, col0), (int) im.NU, G.norm_topk, (float) G.weights_scale));
+    } else {
+        outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
+        outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0)));
+    }
     if (xids) {   // route meter: the exact top-NU and their normalized weights
         ggml_tensor * xw = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), xids), im.NU, n);
         xw = ggml_div(gc, xw, ggml_scale_bias(gc, ggml_sum_rows(gc, xw), 1.0f, 1e-20f));
@@ -1574,9 +1590,13 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, n), b.cols2(im.pre_state, HC, n));
     ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(il), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
-    ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
-                                ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
-    *out = ggml_argsort_top_k(gc, sc, 16);
+    ggml_tensor * rb = ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1);
+    if (route_fuse() && !im.cpu) {   // the same top 16 in one op
+        *out = ggml_dsv41_route(gc, rl, im.BL(il, "exp_probs_b.bias"), rb, nullptr, nullptr, 16, false, 1.0f);
+    } else {
+        ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")), rb);
+        *out = ggml_argsort_top_k(gc, sc, 16);
+    }
     ggml_set_output(*out);
     ggml_build_forward_expand(gf, *out);
     return gf;
@@ -1608,6 +1628,13 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     ggml_tensor * xp = ggml_dsv4_hc_pre(gc, st, b.cols2(im.pre_state, HC, 1));
     ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(next_il), b.rms_w(xp, im.BL(next_il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
+    if (route_fuse() && !im.cpu && !(ahead > 0 && aout)) {   // the same top 16 in one op (build_predict)
+        *pout = ggml_dsv41_route(gc, rl, im.BL(next_il, "exp_probs_b.bias"),
+                                 ggml_reshape_2d(gc, im.ly[(size_t) next_il].rbias, im.NE, 1), nullptr, nullptr, 16, false, 1.0f);
+        ggml_set_output(*pout);
+        ggml_build_forward_expand(gf, *pout);
+        return gf;
+    }
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(next_il, "exp_probs_b.bias")),
                                 ggml_reshape_2d(gc, im.ly[(size_t) next_il].rbias, im.NE, 1));
     // the layers after next_il on the same state (speculative reads): their scores are stacked under next_il's so ONE
