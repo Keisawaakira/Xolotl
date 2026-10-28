@@ -22,10 +22,10 @@ index 1cd81eeae..d2cf3a3c7 100644
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
  
 diff --git i/ggml/include/ggml.h w/ggml/include/ggml.h
-index 224bdef92..8ed25e078 100644
+index 224bdef92..4f57a2a31 100644
 --- i/ggml/include/ggml.h
 +++ w/ggml/include/ggml.h
-@@ -585,6 +585,11 @@ extern "C" {
+@@ -585,6 +585,12 @@ extern "C" {
          GGML_OP_DSV4_HC_COMB,
          GGML_OP_DSV4_HC_PRE,
          GGML_OP_DSV4_HC_POST,
@@ -34,10 +34,11 @@ index 224bdef92..8ed25e078 100644
 +        GGML_OP_DSV41_KV_GATHER,
 +        GGML_OP_DSV41_ROUTE,
 +        GGML_OP_DSV41_HOOK,
++        GGML_OP_DSV41_STREAM,
  
          GGML_OP_UNARY,
  
-@@ -2664,7 +2669,8 @@ extern "C" {
+@@ -2664,7 +2670,8 @@ extern "C" {
      // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
      // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
      // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
@@ -47,7 +48,7 @@ index 224bdef92..8ed25e078 100644
      // res:     [n_kv,       n_batch,    1,       ne3 ]
      //
      // broadcast:
-@@ -2726,6 +2732,72 @@ extern "C" {
+@@ -2726,6 +2733,85 @@ extern "C" {
              struct ggml_tensor  * post,
              struct ggml_tensor  * comb);
  
@@ -117,14 +118,27 @@ index 224bdef92..8ed25e078 100644
 +            ggml_dsv41_hook_t     fn,
 +            void                * ud);
 +
++    // Strata-DS4 (CUDA only): run part of a graph on another stream of the backend. mode:
++    //   0 (fork): the nodes after this one run on stream k (1..7), after the work queued before it
++    //   1 (end): the nodes after this one run on the main stream again
++    //   2 (join): the main stream waits for the work of stream k up to its last end node
++    //   result: a view of a; keep (n <= 9): kept alive up to this node (a join keeps the branch's graph tensors)
++    GGML_API struct ggml_tensor * ggml_dsv41_stream(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   mode,
++            int                   k,
++            struct ggml_tensor ** keep,
++            int                   n);
++
      // custom operators
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
 diff --git i/ggml/src/ggml-backend-meta.cpp w/ggml/src/ggml-backend-meta.cpp
-index 3ec40fb1a..42ebf9904 100644
+index 3ec40fb1a..49a49f2f8 100644
 --- i/ggml/src/ggml-backend-meta.cpp
 +++ w/ggml/src/ggml-backend-meta.cpp
-@@ -1037,7 +1037,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1037,7 +1037,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              } break;
              case GGML_OP_DSV4_HC_COMB:
              case GGML_OP_DSV4_HC_PRE:
@@ -134,15 +148,16 @@ index 3ec40fb1a..42ebf9904 100644
 +            case GGML_OP_DSV41_HC_MIXES:
 +            case GGML_OP_DSV41_KV_GATHER:
 +            case GGML_OP_DSV41_ROUTE:
-+            case GGML_OP_DSV41_HOOK: {
++            case GGML_OP_DSV41_HOOK:
++            case GGML_OP_DSV41_STREAM: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
              case GGML_OP_UNARY: {
 diff --git i/ggml/src/ggml-cpu/ggml-cpu.c w/ggml/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7bc..082a06b10 100644
+index 8bb0ff7bc..7f5fd10b0 100644
 --- i/ggml/src/ggml-cpu/ggml-cpu.c
 +++ w/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2109,6 +2109,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2109,6 +2109,30 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_dsv4_hc_post(params, tensor);
              } break;
@@ -166,10 +181,14 @@ index 8bb0ff7bc..082a06b10 100644
 +            {
 +                GGML_ABORT("DSV41_HOOK is CUDA only");
 +            } break;
++        case GGML_OP_DSV41_STREAM:
++            {
++                GGML_ABORT("DSV41_STREAM is CUDA only");
++            } break;
          case GGML_OP_MAP_CUSTOM1:
              {
                  ggml_compute_forward_map_custom1(params, tensor);
-@@ -2292,9 +2312,17 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2292,9 +2316,18 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_DSV4_HC_COMB:
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
@@ -181,6 +200,7 @@ index 8bb0ff7bc..082a06b10 100644
 +        case GGML_OP_DSV41_KV_GATHER:
 +        case GGML_OP_DSV41_ROUTE:
 +        case GGML_OP_DSV41_HOOK:
++        case GGML_OP_DSV41_STREAM:
 +            {
 +                n_tasks = 1;
 +            } break;
@@ -188,16 +208,17 @@ index 8bb0ff7bc..082a06b10 100644
          case GGML_OP_REPEAT_BACK:
          case GGML_OP_LEAKY_RELU:
 diff --git i/ggml/src/ggml-cpu/ggml-cpu.cpp w/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 1df0f2bb9..b7d078615 100644
+index 1df0f2bb9..c537caa78 100644
 --- i/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ w/ggml/src/ggml-cpu/ggml-cpu.cpp
-@@ -440,6 +440,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+@@ -440,6 +440,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
      }
  
      switch (op->op) {
 +        case GGML_OP_DSV41_KV_GATHER:
 +        case GGML_OP_DSV41_ROUTE:
 +        case GGML_OP_DSV41_HOOK:
++        case GGML_OP_DSV41_STREAM:
 +            return false;   // CUDA only
          case GGML_OP_CPY:
          case GGML_OP_SET_ROWS:
@@ -647,6 +668,18 @@ index 3abb6448a..ec19385ce 100644
  #ifdef GGML_CUDA_USE_CUB
  int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows);
  void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
+diff --git i/ggml/src/ggml-cuda/common.cuh w/ggml/src/ggml-cuda/common.cuh
+index 2e78ae4fa..b518eb302 100644
+--- i/ggml/src/ggml-cuda/common.cuh
++++ w/ggml/src/ggml-cuda/common.cuh
+@@ -1456,6 +1456,7 @@ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
++    cudaEvent_t dsv41_events[GGML_CUDA_MAX_STREAMS][2] = { { nullptr } };   // ggml_dsv41_stream: fork, end per stream
+ 
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
 diff --git i/ggml/src/ggml-cuda/cpy-utils.cuh w/ggml/src/ggml-cuda/cpy-utils.cuh
 index 7697c292d..f98b32a81 100644
 --- i/ggml/src/ggml-cuda/cpy-utils.cuh
@@ -1112,10 +1145,55 @@ index 3c5bea5f4..89e759fb2 100644
 +
 +void ggml_cuda_op_dsv41_kv_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git i/ggml/src/ggml-cuda/ggml-cuda.cu w/ggml/src/ggml-cuda/ggml-cuda.cu
-index a9038f1f4..0e67e48d3 100644
+index a9038f1f4..e452a6896 100644
 --- i/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ w/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2391,6 +2391,23 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -705,6 +705,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    for (auto & evs : dsv41_events) {
++        for (cudaEvent_t ev : evs) {
++            if (ev != nullptr) {
++                CUDA_CHECK(cudaEventDestroy(ev));
++            }
++        }
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -2064,6 +2071,30 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++// Strata-DS4: see ggml_dsv41_stream
++static void ggml_cuda_op_dsv41_stream(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const int mode = ggml_get_op_params_i32(dst, 0);
++    const int k    = ggml_get_op_params_i32(dst, 1);
++    GGML_ASSERT(k >= 1 && k < GGML_CUDA_MAX_STREAMS);
++    cudaEvent_t & ev = ctx.dsv41_events[k][mode == 0 ? 0 : 1];
++    if (ev == nullptr) {
++        CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
++    }
++    if (mode == 0) {
++        GGML_ASSERT(ctx.curr_stream_no == 0);
++        CUDA_CHECK(cudaEventRecord(ev, ctx.stream()));
++        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(ctx.device, k), ev));
++        ctx.curr_stream_no = k;
++    } else if (mode == 1) {
++        GGML_ASSERT(ctx.curr_stream_no == k);
++        CUDA_CHECK(cudaEventRecord(ev, ctx.stream()));
++        ctx.curr_stream_no = 0;
++    } else {
++        GGML_ASSERT(ctx.curr_stream_no == 0);
++        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ev));
++    }
++}
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+@@ -2391,6 +2422,26 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -1136,10 +1214,13 @@ index a9038f1f4..0e67e48d3 100644
 +                memcpy(&p, dst->op_params, sizeof(p));
 +                p.fn((void *) ctx.stream(), dst, p.ud);
 +            } break;
++        case GGML_OP_DSV41_STREAM:
++            ggml_cuda_op_dsv41_stream(ctx, dst);
++            break;
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -2560,6 +2577,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2560,6 +2611,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
@@ -1152,7 +1233,7 @@ index a9038f1f4..0e67e48d3 100644
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
  
-@@ -2567,6 +2590,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2567,6 +2624,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
              continue;
          }
  
@@ -1165,7 +1246,7 @@ index a9038f1f4..0e67e48d3 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -4797,6 +4826,29 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+@@ -4797,6 +4860,29 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
  }
  
@@ -1195,7 +1276,7 @@ index a9038f1f4..0e67e48d3 100644
  int ggml_backend_cuda_get_device_count() {
      return ggml_cuda_info().device_count;
  }
-@@ -5209,6 +5261,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5209,6 +5295,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -1203,7 +1284,7 @@ index a9038f1f4..0e67e48d3 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5226,7 +5279,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5226,7 +5313,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -1213,7 +1294,7 @@ index a9038f1f4..0e67e48d3 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -5499,6 +5553,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5499,6 +5587,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -1232,6 +1313,7 @@ index a9038f1f4..0e67e48d3 100644
 +            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) && op->src[0]->ne[0] <= 1024 &&
 +                op->op_params[0] >= 1 && op->op_params[0] <= 32;
 +        case GGML_OP_DSV41_HOOK:
++        case GGML_OP_DSV41_STREAM:
 +            return true;
          case GGML_OP_FLASH_ATTN_EXT:
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
@@ -1982,10 +2064,10 @@ index da0e24fcd..50eda05e2 100644
                  }
  
 diff --git i/ggml/src/ggml.c w/ggml/src/ggml.c
-index 175281409..aa4e6a263 100644
+index 175281409..13935438f 100644
 --- i/ggml/src/ggml.c
 +++ w/ggml/src/ggml.c
-@@ -1084,6 +1084,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1084,6 +1084,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_COMB",
      "DSV4_HC_PRE",
      "DSV4_HC_POST",
@@ -1994,19 +2076,20 @@ index 175281409..aa4e6a263 100644
 +    "DSV41_KV_GATHER",
 +    "DSV41_ROUTE",
 +    "DSV41_HOOK",
++    "DSV41_STREAM",
  
      "UNARY",
  
-@@ -1101,7 +1106,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1101,7 +1107,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "GLU",
  };
  
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
++static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1199,6 +1204,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1199,6 +1205,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "dsv4_hc_comb(mixes, scale, base)",
      "dsv4_hc_pre(x, weights)",
      "dsv4_hc_post(x, residual, post, comb)",
@@ -2015,19 +2098,20 @@ index 175281409..aa4e6a263 100644
 +    "dsv41_kv_gather(a, ia, b, ib)",
 +    "dsv41_route(logits, b0, b1)",
 +    "dsv41_hook(a, b, c)",
++    "dsv41_stream(a)",
  
      "unary(x)",
  
-@@ -1216,7 +1226,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1216,7 +1228,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "glu(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
++static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5445,6 +5455,9 @@ struct ggml_tensor * ggml_argsort_top_k(
+@@ -5445,6 +5457,9 @@ struct ggml_tensor * ggml_argsort_top_k(
      GGML_ASSERT(a->ne[0] >= k);
  
      struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
@@ -2037,7 +2121,7 @@ index 175281409..aa4e6a263 100644
  
      result = ggml_view_4d(ctx, result,
                  k, result->ne[1], result->ne[2], result->ne[3],
-@@ -6429,9 +6442,9 @@ struct ggml_tensor * ggml_lightning_indexer(
+@@ -6429,9 +6444,9 @@ struct ggml_tensor * ggml_lightning_indexer(
  
      GGML_ASSERT(       q->type == GGML_TYPE_F32);
      GGML_ASSERT( weights->type == GGML_TYPE_F32);
@@ -2049,7 +2133,7 @@ index 175281409..aa4e6a263 100644
      GGML_ASSERT(      q->ne[1] == weights->ne[0]);
      GGML_ASSERT(      k->ne[1] == 1);
      GGML_ASSERT(   mask->ne[1] == q->ne[2]);
-@@ -6545,6 +6558,112 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
+@@ -6545,6 +6560,131 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
      return result;
  }
  
@@ -2156,6 +2240,25 @@ index 175281409..aa4e6a263 100644
 +    result->src[0] = a;
 +    result->src[1] = b;
 +    result->src[2] = c;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_stream(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        int                   mode,
++        int                   k,
++        struct ggml_tensor ** keep,
++        int                   n) {
++    GGML_ASSERT(mode >= 0 && mode <= 2 && k >= 1 && n >= 0 && n < GGML_MAX_SRC);
++    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
++    const int32_t params[2] = { mode, k };
++    ggml_set_op_params(result, params, sizeof(params));
++    result->op     = GGML_OP_DSV41_STREAM;
++    result->src[0] = a;
++    for (int i = 0; i < n; ++i) {
++        result->src[1 + i] = keep[i];
++    }
 +    return result;
 +}
 +
