@@ -681,10 +681,10 @@ index 2e78ae4fa..b518eb302 100644
      cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
      cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
 diff --git i/ggml/src/ggml-cuda/cpy-utils.cuh w/ggml/src/ggml-cuda/cpy-utils.cuh
-index 7697c292d..f98b32a81 100644
+index 7697c292d..86d0fb800 100644
 --- i/ggml/src/ggml-cuda/cpy-utils.cuh
 +++ w/ggml/src/ggml-cuda/cpy-utils.cuh
-@@ -186,6 +186,98 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
+@@ -186,6 +186,151 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
      y->d = sumq2 > 0 ? sumqx/sumq2 : d;
  }
  
@@ -779,6 +779,59 @@ index 7697c292d..f98b32a81 100644
 +        y->qs[j] = (uint8_t) (c0 | (c1 << 4));
 +    }
 +}
++
++// The same two packers with one thread per value (set_rows with GGML_CUDA_FP4_PACK=1): x is value j of block y, and
++// the 32 lanes of the warp hold 32 consecutive values of the block in order. The lanes of a (sub-)block vote on each
++// candidate scale and keep the first one all of them reproduce: the same scales and codes as the loops above.
++// CUDA only (32-lane warps and the warp votes).
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static __device__ __forceinline__ void quantize_f32_nvfp4_ds41_lane(const float x, block_nvfp4 * __restrict__ y, const int j) {
++    float amax = fmaxf(0.0f, fabsf(x));
++#pragma unroll
++    for (int o = QK_NVFP4_SUB/2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o, QK_NVFP4_SUB));
++    float s = 0x1p-9f;
++    bool exact = amax == 0.0f;
++    const float qm[7] = { 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f };
++    const int sh = j & 16;                                   // this sub-block's bits in the warp ballot
++    for (int k = 0; k < 7; ++k) {                            // every lane runs all 7 (the ballot needs the whole warp)
++        const float c = ds41_round_e4m3(amax / qm[k]);
++        const bool ok = c > 0.0f && ds41_e2m1_exact(x, c) >= 0;
++        const bool all = ((__ballot_sync(0xffffffff, ok) >> sh) & 0xffff) == 0xffff;
++        if (!exact && all) { s = c; exact = true; }
++    }
++    if (!exact) s = fmaxf(ds41_round_e4m3(amax / 6.0f), 0x1p-9f);
++    int c = ds41_e2m1_exact(x, s);
++    if (c < 0) c = ds41_e2m1_nearest(x / s) | (x < 0.0f ? 8 : 0);
++    const int c1 = __shfl_down_sync(0xffffffff, c, QK_NVFP4_SUB/2, QK_NVFP4_SUB);
++    const int sb = j / QK_NVFP4_SUB, l = j % QK_NVFP4_SUB;
++    if (l == 0) y->d[sb] = ds41_e4m3_bits(s);
++    if (l < QK_NVFP4_SUB/2) y->qs[sb*(QK_NVFP4_SUB/2) + l] = (uint8_t) (c | (c1 << 4));
++}
++
++static __device__ __forceinline__ void quantize_f32_mxfp4_ds41_lane(const float x, block_mxfp4 * __restrict__ y, const int j) {
++    float amax = fmaxf(0.0f, fabsf(x));
++#pragma unroll
++    for (int o = QK_MXFP4/2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o, QK_MXFP4));
++    int E = -127;
++    if (amax > 0.0f) {                                       // the same for the whole warp (= the block)
++        int e; frexpf(amax, &e);
++        bool found = false;
++        for (int k = 0; k < 4; ++k) {
++            const int t = e - 3 + (k == 0 ? 0 : k == 1 ? 1 : k == 2 ? -1 : 2);
++            const bool all = __all_sync(0xffffffff, ds41_e2m1_exact(x, ldexpf(1.0f, t)) >= 0);
++            if (!found && all) { E = t; found = true; }
++        }
++        if (!found) { int e2; frexpf(amax / 6.0f, &e2); E = e2; }
++    }
++    E = max(-126, min(127, E));
++    const float s = ldexpf(1.0f, E);
++    int c = ds41_e2m1_exact(x, s);
++    if (c < 0) c = ds41_e2m1_nearest(x / s) | (x < 0.0f ? 8 : 0);
++    const int c1 = __shfl_down_sync(0xffffffff, c, QK_MXFP4/2, QK_MXFP4);
++    if (j == 0) y->e = (uint8_t) (E + 127);
++    if (j < QK_MXFP4/2) y->qs[j] = (uint8_t) (c | (c1 << 4));
++}
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 +
  // Wrapper functions for cpy.cu compatibility
  static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
@@ -1894,13 +1947,147 @@ index 6923f3510..c4359210d 100644
      }
  }
 diff --git i/ggml/src/ggml-cuda/set-rows.cu w/ggml/src/ggml-cuda/set-rows.cu
-index 465997065..57cdad285 100644
+index 465997065..340afa8e8 100644
 --- i/ggml/src/ggml-cuda/set-rows.cu
 +++ w/ggml/src/ggml-cuda/set-rows.cu
-@@ -317,6 +317,26 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
+@@ -110,6 +110,111 @@ static void set_rows_cuda_quant(
+     }
+ }
+ 
++// Strata DS4.1 --kv-fp4 packers with one thread per value (GGML_CUDA_FP4_PACK=1, see cpy-utils.cuh). A single
++// decode row has only 8 blocks, so the per-block kernel above runs 8 threads; this one runs 512, same bytes.
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++static bool ggml_cuda_fp4_pack_lane() {
++    static const bool on = [] {
++        const char * e = std::getenv("GGML_CUDA_FP4_PACK");
++        return e && std::atoi(e) != 0;
++    }();
++    return on;
++}
++
++template <typename idx_t, typename block_type, int qk, void (*pack_lane)(float, block_type *, int)>
++static __global__ void k_set_rows_fp4_lane(const float * __restrict__ src0,
++                                           const idx_t * __restrict__ src1,
++                                           block_type * __restrict__ dst,
++                                           const int64_t ne_total,
++                                           const int64_t s01,
++                                           const int64_t s02,
++                                           const int64_t s03,
++                                           const int64_t s10,
++                                           const int64_t s11,
++                                           const int64_t s12,
++                                           const int64_t s1,
++                                           const int64_t s2,
++                                           const int64_t s3,
++                                           const uint3   ne00,
++                                           const uint3   ne01,
++                                           const uint3   ne02,
++                                           const uint3   ne11_fd,
++                                           const uint3   ne12_fd) {
++    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
++
++    if (i >= ne_total) {   // ne_total is a multiple of qk >= 32: whole warps leave
++        return;
++    }
++
++    uint32_t tmp = (uint32_t) i;
++    uint2    div_mod;
++
++    div_mod           = fast_div_modulo(tmp, ne00);
++    const int64_t i00 = div_mod.y;
++    tmp               = div_mod.x;
++
++    div_mod           = fast_div_modulo(tmp, ne01);
++    const int64_t i01 = div_mod.y;
++    tmp               = div_mod.x;
++
++    div_mod           = fast_div_modulo(tmp, ne02);
++    const int64_t i02 = div_mod.y;
++    const int64_t i03 = div_mod.x;
++
++    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
++    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
++    const int64_t i10 = i01;
++
++    ggml_cuda_pdl_sync();
++    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
++
++    const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
++    block_type * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_type);
++
++    pack_lane(src0_row[i00], dst_row_ptr + i00 / qk, (int) (i00 % qk));
++}
++
++template<typename idx_t, typename block_type, int qk, void (*pack_lane)(float, block_type *, int)>
++static void set_rows_cuda_fp4_lane(
++        const float * src0_d, const idx_t * src1_d, block_type * dst_d,
++        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
++        const int64_t ne11, const int64_t ne12,
++        const size_t nb01, const size_t nb02, const size_t nb03,
++        const size_t nb10, const size_t nb11, const size_t nb12,
++        const size_t nb1, const size_t nb2, const size_t nb3,
++        cudaStream_t stream) {
++
++    GGML_ASSERT(ne00 % qk == 0);
++    static_assert(qk % 32 == 0 && CUDA_SET_ROWS_BLOCK_SIZE % 32 == 0, "a warp must hold 32 values of one block");
++    const int64_t ne_total = ne00 * ne01 * ne02 * ne03;
++    const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
++    const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
++    const dim3 grid_size(num_blocks);
++
++    const int64_t s01 = nb01/sizeof(float);
++    const int64_t s02 = nb02/sizeof(float);
++    const int64_t s03 = nb03/sizeof(float);
++    const int64_t s10 = nb10/sizeof(idx_t);
++    const int64_t s11 = nb11/sizeof(idx_t);
++    const int64_t s12 = nb12/sizeof(idx_t);
++    const int64_t s1  = nb1;
++    const int64_t s2  = nb2;
++    const int64_t s3  = nb3;
++
++    if (ne_total > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
++        const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
++        const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
++        const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
++        const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
++        const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
++
++        k_set_rows_fp4_lane<idx_t, block_type, qk, pack_lane><<<grid_size, block_size, 0, stream>>>(
++            src0_d, src1_d, dst_d, ne_total, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd, ne02_fd,
++            ne11_fd, ne12_fd);
++    }
++}
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
+ template <typename src_t, typename idx_t, typename dst_t>
+ static __global__ void k_set_rows(const src_t * src0_ptr,
+                                   const idx_t * src1_ptr,
+@@ -317,6 +422,48 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
              nb1, nb2, nb3,
              stream
          );
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    } else if (dst->type == GGML_TYPE_NVFP4 && ggml_cuda_fp4_pack_lane()) {
++        set_rows_cuda_fp4_lane<idx_t, block_nvfp4, QK_NVFP4, quantize_f32_nvfp4_ds41_lane>(
++            src0_d, src1_d, (block_nvfp4*)dst->data,
++            ne00, ne01, ne02, ne03,
++            ne11, ne12,
++            nb01, nb02, nb03,
++            nb10, nb11, nb12,
++            nb1, nb2, nb3,
++            stream
++        );
++    } else if (dst->type == GGML_TYPE_MXFP4 && ggml_cuda_fp4_pack_lane()) {
++        set_rows_cuda_fp4_lane<idx_t, block_mxfp4, QK_MXFP4, quantize_f32_mxfp4_ds41_lane>(
++            src0_d, src1_d, (block_mxfp4*)dst->data,
++            ne00, ne01, ne02, ne03,
++            ne11, ne12,
++            nb01, nb02, nb03,
++            nb10, nb11, nb12,
++            nb1, nb2, nb3,
++            stream
++        );
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 +    } else if (dst->type == GGML_TYPE_NVFP4) {   // Strata DS4.1 --kv-fp4: exact packing of fake-quantized rows
 +        set_rows_cuda_quant<idx_t, block_nvfp4, QK_NVFP4, quantize_f32_nvfp4_ds41_block>(
 +            src0_d, src1_d, (block_nvfp4*)dst->data,
