@@ -1976,6 +1976,100 @@ index 465997065..340afa8e8 100644
      } else {
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index b0f609990..cd850507b 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -178,7 +178,8 @@ static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, in
+     }
+ }
+ 
+-template<int BLOCK_SIZE>
++// xolotl: EQUAL = false leaves the keys equal to the k-th value to top_k_radix_gather_equal (CUDA builds)
++template<int BLOCK_SIZE, bool EQUAL = true>
+ static __global__ void top_k_radix_gather(
+         const float * __restrict__ src,
+         int * __restrict__ dst,
+@@ -200,7 +201,7 @@ static __global__ void top_k_radix_gather(
+         if (key > state->prefix) {
+             const int pos = atomicAdd(&state->greater_count, 1);
+             row_dst[pos] = col;
+-        } else if (key == state->prefix) {
++        } else if (EQUAL && key == state->prefix) {
+             const int pos = atomicAdd(&state->equal_count, 1);
+             if (pos < state->rank) {
+                 row_dst[k - state->rank + pos] = col;
+@@ -209,6 +210,52 @@ static __global__ void top_k_radix_gather(
+     }
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++// xolotl: the keys equal to the k-th value, one block per row in column order - ties go to the lowest columns, the same
++// every run (the atomic order above picks a different tie set run to run: DeepSeek's low-precision indexer scores tie
++// often, and a long prompt then gave other answers on every run)
++template<int BLOCK_SIZE>
++static __global__ void top_k_radix_gather_equal(
++        const float * __restrict__ src,
++        int * __restrict__ dst,
++        const top_k_radix_state * __restrict__ states,
++        int ncols,
++        int k) {
++    constexpr int NW = BLOCK_SIZE / WARP_SIZE;
++    __shared__ int warp_n[NW];
++
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int lane = tid % WARP_SIZE;
++    const int warp = tid / WARP_SIZE;
++    const top_k_radix_state state = states[row];
++    const float * row_src = src + (size_t) row * ncols;
++    int * row_dst = dst + (size_t) row * k + (k - state.rank);
++
++    int base = 0;
++    for (int col0 = 0; col0 < ncols && base < state.rank; col0 += BLOCK_SIZE) {
++        const int col = col0 + tid;
++        const bool eq = col < ncols && top_k_float_to_ordered(row_src[col]) == state.prefix;
++        const unsigned mask = __ballot_sync(0xffffffff, eq);
++        if (lane == 0) {
++            warp_n[warp] = __popc(mask);
++        }
++        __syncthreads();
++        int pos = base + __popc(mask & ((1u << lane) - 1));
++        int tile_n = 0;
++        for (int w = 0; w < NW; ++w) {
++            pos += w < warp ? warp_n[w] : 0;
++            tile_n += warp_n[w];
++        }
++        if (eq && pos < state.rank) {
++            row_dst[pos] = col;
++        }
++        base += tile_n;
++        __syncthreads();
++    }
++}
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
+ static void top_k_radix_cuda(
+         ggml_cuda_pool & pool,
+         const float * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+@@ -241,9 +288,17 @@ static void top_k_radix_cuda(
+ 
+         top_k_radix_reset_counters
+             <<<(iter_nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, iter_nrows);
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        top_k_radix_gather<BLOCK_SIZE, false>
++            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                src, dst, states, ncols, k, blocks_per_row);
++        top_k_radix_gather_equal<BLOCK_SIZE>
++            <<<iter_nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
++#else
+         top_k_radix_gather<BLOCK_SIZE>
+             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                 src, dst, states, ncols, k, blocks_per_row);
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ 
+         src += (size_t) ncols * iter_nrows;
+         dst += (size_t) k     * iter_nrows;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 index 33936acae..cb6ff367c 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
