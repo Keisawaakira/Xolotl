@@ -15,7 +15,8 @@
 // The tables can also come from a GGUF (ISTA-DASLab's DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf: blk.{1,14}.engram_embd.weight
 // IQ4_NL [256, rows], one 144-byte row per hash id): pass the .gguf file itself as an --engram entry.  The row reader is the
 // same (sorted, page-coalesced preads, row cache); a row is one span (no separate scale tensor) dequantized at read.  The
-// hash geometry still comes from the backbone GGUF; the table rows must match it.  The hot set (FP8 rows) is not used then.
+// hash geometry still comes from the backbone GGUF; the table rows must match it.  A hot set for it is a version-2 pack of
+// the GGUF's own raw rows (ds41_engram_hot pack); a version-1 (FP8) pack is skipped.
 #pragma once
 
 #include "ds41_geometry.hpp"
@@ -54,6 +55,8 @@ public:
     int64_t n_cols() const { return cols_; }                    ///< hash columns per token per layer (24)
     int64_t row_dim() const { return dim_; }                    ///< 256
     int64_t raw_row_bytes() const { return wrow_ + srow_; }     ///< a raw row's bytes: 264 (FP8 + scales) or 210 (Q6_K)
+    int64_t scale_row_bytes() const { return srow_; }           ///< of which the scale span: 8 (FP8), 0 (a GGUF table)
+    int table_type() const { return qtype_; }                   ///< -1 (HF FP8), else the GGUF type (IQ4_NL 20, Q6_K 14)
     /// Record token `tid` at position `pos` (history for the hashes; positions may be rewritten).
     void set_token(int64_t pos, int tid);
     /// Record position `pos` as a DEAD token (an image span): it takes no part in any n-gram and stops the look-back,
