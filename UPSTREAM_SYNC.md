@@ -62,3 +62,13 @@ and two pictures; engine pinned/ds41_generate-rb22.exe, sha256 31d3f0fc..., buil
   (decode 59, the 15.7K prompt 14.4 s instead of 10.1) differed from code1 on: the slow state's timing, not rb22.
 - STRATA_PF_ORDER=arena: -1.5 % decode in an ABBA (66.80 / 65.79 / 67.25 / 68.22 tok/s), other placements and so other
   answers.  Not used.
+- rb23 (llama.cpp 6050b467; pinned/ds41_generate-rb23b.exe, sha256 601decfb..., after the top-k fix below): the same
+  fidelity to the original as rb22 on the Qwen KLD texts (16 chunks, the prompt path: EAR 86.09 / 86.07 %, KLD 0.1620 /
+  0.1626, PPL ratio 1.0526 / 1.0529; 4 chunks, decode with the live route bias: EAR 84.69 / 84.66 %); rb22 -> rb23 is KLD
+  0.0098, a sixteenth of the quantization's 0.16.  Decode 0 to +2 % (two ABBAs: +0.2 %, +2.4 % with a cold first rb22
+  run), prompts the same (15.7K 10.4 s).  Other answers than rb22 from a few tokens on (the numerics).
+- The first rb23 build gave other answers run to run from the 15.7K prompt on: llama.cpp's batched top-k gathers the
+  ties of the k-th value in atomic order.  rb8e's in-order tie gather is back on its radix path (the commit before this
+  note); since then two rb23 runs give the same 13 answers.
+- TURN_SAVE (rb22, the history-edit check): a 9.3K-token system prompt, three turns, then turn 2's question rewritten:
+  9,299 tokens reused, 145 read in 1.83 s, against everything re-read (9,444 tokens, 7.74 s) with it off; the same answer.
