@@ -20,7 +20,7 @@ Remote: `upstream` = https://github.com/Indras-Mirror/Xolotl.git (`git fetch ups
 
 ## Sync 1 (2026-10-29, rb22): upstream 03a138f8..bcaf9c9d
 
-45 commits, 39 without the merges: 9 taken, 2 deferred, 28 skipped.
+45 commits, 39 without the merges: 9 taken, 2 taken on rb23 only, 28 skipped.
 
 Taken:
 
@@ -36,11 +36,18 @@ Taken:
 | b2d0dbb4 | 71d497b7 | ds41-engine.sh container fallback, DS41_PASS_GRAPH_MIB, STRATA_TIER_ORDER=load (opt-in). DS4_TIER_PROF: rb17's own running print kept instead of upstream's (conflict) | off |
 | 894d766b | ca898487 | STRATA_SERVE_TURN_SAVE (default on): the turn boundary a request moves past goes to the pool | saves only |
 
-Deferred (step 2, its own branch):
+Taken on the branch local/b54-rb23 only (2026-10-29, a candidate until its serve check; it changes the numerics):
 
-- 48b5482c: the vendored ggml moves to llama.cpp 6050b467 (825 commits). This tree's own ggml changes (rb8e, rb8g,
-  rb10-rb14 and rb16, in tools/xolotl/ggml/xolotl-ggml.patch) have to be re-applied on it, and the numerics change.
-- a7523418: fetch-llama.sh pins that llama.cpp commit.
+| upstream | local | what |
+|---|---|---|
+| 48b5482c | 56a42759 | the vendored ggml moves to llama.cpp 6050b467 (825 commits): upstream's new xolotl-ggml.patch, as is |
+| a7523418 | 112c0ee2 | fetch-llama.sh pins 6050b467 |
+
+The commit after them (local rb23) re-applies this tree's own ggml changes (rb8g, rb10-rb14 and rb16: the ops
+DSV41_KV_GATHER / ROUTE / HOOK / STREAM, the FP4 packers, the stream hooks) on that tree with a three-way merge, and
+writes the patch again. Conflicts: argsort.cuh (both declarations kept), ggml.c (GGML_OP_COUNT 104 + 4 = 108), and
+top-k.cu, where llama.cpp now batches many-row top-k itself (radix / bitonic): its version replaces rb8e's
+(GGML_CUDA_TOPK_PER_ROW is gone).
 
 Skipped (the MiniMax M3.1 port: tools/m31, docs/MINIMAX*, its CMake option; nothing DeepSeek):
 41c46c2f b7121972 45b54299 e28d89b8 060046f3 0bbf7f09 3c631777 dbb15cc3 616a33db b810557f 42f5a1c4 5cdfc335
