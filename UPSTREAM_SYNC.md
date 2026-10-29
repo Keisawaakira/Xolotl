@@ -53,3 +53,12 @@ Skipped (the MiniMax M3.1 port: tools/m31, docs/MINIMAX*, its CMake option; noth
 41c46c2f b7121972 45b54299 e28d89b8 060046f3 0bbf7f09 3c631777 dbb15cc3 616a33db b810557f 42f5a1c4 5cdfc335
 a67f1b7e f44fe3c3 b510efdd bd819920 693c2f8e 14de1a89 ac679f08 f5b2324c e5cf56e9 b48f8cca 9199afe1 25cf02f0
 cb8b3a56 ff133673 70af23b5 481daf73
+
+Checked (2026-10-29 evening, the serve scenarios on K:\model\test's DeepSeek config: 11 text scenarios, the cancel pair
+and two pictures; engine pinned/ds41_generate-rb22.exe, sha256 31d3f0fc..., built with CUDA 13.4):
+
+- rb22 gives rb21's answers in all 13 (a warm rb21 run next to it; decode 65.42 vs 65.17 tok/s), with TURN_SAVE and
+  REWIND_GAP on or off, and the same answers in all four rb22 runs.  An rb21 run started cold after an idle hour
+  (decode 59, the 15.7K prompt 14.4 s instead of 10.1) differed from code1 on: the slow state's timing, not rb22.
+- STRATA_PF_ORDER=arena: -1.5 % decode in an ABBA (66.80 / 65.79 / 67.25 / 68.22 tok/s), other placements and so other
+  answers.  Not used.
