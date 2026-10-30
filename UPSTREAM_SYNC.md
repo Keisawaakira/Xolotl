@@ -12,10 +12,11 @@ Remote: `upstream` = https://github.com/Indras-Mirror/Xolotl.git (`git fetch ups
 | | upstream commit | date | |
 |---|---|---|---|
 | last rebase (the merge base) | `03a138f8` (PR #54) | 2026-10-26 | rb1-rb21 sit on it |
-| reviewed up to | `bcaf9c9d` (PR #69) | 2026-10-29 | every commit up to it is taken, deferred or skipped below |
+| reviewed up to | `40cca4d2` (PR #106) | 2026-11-03 | every commit up to it is taken, deferred or skipped below |
 
 - What upstream has added since the last review:
-  `git fetch upstream && git log --reverse --no-merges --format='%h %s' bcaf9c9d..upstream/main`
+  `git fetch upstream && git log --reverse --first-parent --format='%h %s' 40cca4d2..upstream/main` (first-parent: since
+  c7a1c73f upstream's history also holds upstream Strata's own 2,586 commits)
 - The commits taken so far: `git log --format='%h %s' --grep='cherry picked from commit' 03a138f8..HEAD`
 
 ## Sync 1 (2026-10-29, rb22): upstream 03a138f8..bcaf9c9d
@@ -72,3 +73,41 @@ and two pictures; engine pinned/ds41_generate-rb22.exe, sha256 31d3f0fc..., buil
   note); since then two rb23 runs give the same 13 answers.
 - TURN_SAVE (rb22, the history-edit check): a 9.3K-token system prompt, three turns, then turn 2's question rewritten:
   9,299 tokens reused, 145 read in 1.83 s, against everything re-read (9,444 tokens, 7.74 s) with it off; the same answer.
+
+## Sync 2 (2026-11-03, rb28): upstream bcaf9c9d..40cca4d2
+
+2,730 commits, but 2,586 of them are upstream Strata's (Niko1221/Strata, 14-31 Oct: the Qwen engines and the shared
+server), which upstream merged in c7a1c73f; Xolotl's own first-parent history is 71 commits (PRs #75-#106).  No rebase
+and no merge of c7a1c73f: nothing in it is for DeepSeek-V4.1, and upstream needed 2bb0585a .. 4b8daa7e, 872f42c0 and
+148e0623 afterwards to make its own DeepSeek / GLM serving work again.  1 taken, the rest deferred or skipped.
+
+Taken:
+
+| upstream | local | what | default path |
+|---|---|---|---|
+| 41edc4e2 (#79) | this commit | serve: a request waiting for the control lines re-checks its turn under slot_cv before it waits, and the last fairness waiter is woken (a lost wakeup cost it up to 0.5 s) | queued requests only |
+
+Deferred:
+
+- eb00b1c8 (#106) a turn cut inside a DSML tag sends no DSML text: written for serve/dsml.py, which came with the Strata
+  merge.  The same class of bug is in this tree's serve_ds41.py (`_op_finish_ds41` hands a held `<｜DSML｜ ...` out as
+  content when max_tokens or a cancel ends the turn inside it); it needs its own port.
+- 2788df67 (#88) wake cancelled requests waiting for a native slot, 2d1df99d (#100) a request over the batch slot count
+  waits instead of a 503: batch slots (parallel > 1) only; both are written against the post-merge server.py and do not
+  apply here.
+- f152c928 (#87) fused router ops + batched state copies: the router half is what ROUTE_FUSE=2 already does; the copies
+  op (8 end-of-layer ggml_cpy's in 2 launches) would have to respect ATTN_TAIL=3 / GRAPH_CONC=7's split of those writes.
+
+Skipped:
+
+- 5b06a59e ds41 pad past 65,535 keys: the vendored llama.cpp 6050b467 already loops its CUDA pad kernel past 65,535 rows
+  (llama.cpp c35b66744, #30147, 2026-10-08), so this tree never had the bug.  Its STRATA_FILEG_ADMIT is gpu_run_n_ex
+  (batch / verify) only; PTQ1_0 is not used here.
+- c5897a64 / 4ab7edfc / 2058ac7c (#75, deep sleep): the CUDA driver checkpoint API (Linux).
+- 3517cbb6 / 046e6db1 (STRATA_ZFS_ARC): Linux.
+- 51a4b712, 57cb32d6, 41190e21: loaders / kernels for other GGUF layouts (llama.cpp's deepseek41, combined Engram and
+  DSpark assets, Unsloth's UD-Q2_K_XL IQ3_S downs); this tree runs its own conversions.
+- 8c258be0 (#98) layer split, 14558ac4 + #89 (shared checkpoint payloads), #90, #91, #92, #93, #95, #96, #101, #102,
+  #104, #105, #86 (IQ1_S experts): the layer split, Qwen3.6, MiniMax, Metal, HIP and tokenizer-cache work.
+- 872f42c0, 148e0623, 2bb0585a .. 4b8daa7e: repairs of the Strata merge.
+- The qwen38 / xol-qfn / LFM3 / voice / README / docs commits, and ddb631bf's opt-in request log (serve; not needed).
