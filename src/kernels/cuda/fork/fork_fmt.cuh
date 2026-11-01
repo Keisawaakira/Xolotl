@@ -7,6 +7,9 @@ template<> struct Fmt<10> { static constexpr int qk = 256, ipb = QI2_K / VDR_Q2_
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K / VDR_Q3_K, step = VDR_Q3_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q3_K_q8_1(v, y, kbx, iqs); } };
+// IQ1_S (19): one 32-value sub-block per call, as IQ1_M (Unsloth's Dynamic V3.1 DeepSeek-V4.1 GGUFs)
+template<> struct Fmt<19> { static constexpr int qk = 256, ipb = 8, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<39> { static constexpr int qk = 32, ipb = QI_MXFP4 / VDR_MXFP4, step = VDR_MXFP4;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_mxfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -34,10 +37,12 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 // per-column kernel were already there for the MiMo down outliers, only the gate/up list did not name it, so
 // native_expert_supported refused the file ("layer 0's experts are MXFP4/MXFP4 ..., no GPU kernels for")
 // ... and DeepSeek-V4.1's native expert tier (the checkpoint's own E2M1+E8M0 bytes, lossless) - ds41_geometry.hpp
-#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(39) X(143)
+// IQ1_S (19) gate/up and down: Unsloth's Dynamic V3.1 DeepSeek-V4.1 GGUFs (UD-IQ1_M: IQ1_S gate/up on 20 of 40 layers,
+// IQ1_S down on 5; UD-IQ2_XXS: IQ1_S gate/up on 10) - Fmt<19> above, Split<19> in fork_split.cuh (upstream 6fcb780c)
+#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(19) X(39) X(143)
 // IQ2_XXS / IQ2_XS / IQ1_M downs (16 / 17 / 29): ISTA-DASLab's GSQ-RCO DeepSeek-V4.1 GGUFs pick them for whole
 // ffn_down_exps tensors (upstream's down list has none of the three; their Fmt<> and the gate/up list already exist)
 // IQ3_S (21) as a down: Unsloth's DeepSeek-V4.1-Flash-1017 UD-IQ3_XXS has it on layers 35-37 and 39 (Fmt<21> is
 // upstream's, already in STRATA_GU_FMTS).
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(21) X(22) X(29) X(39) X(143)
+#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(19) X(21) X(22) X(29) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(143)

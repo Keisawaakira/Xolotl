@@ -87,6 +87,13 @@ Taken:
 |---|---|---|---|
 | 41edc4e2 (#79) | this commit | serve: a request waiting for the control lines re-checks its turn under slot_cv before it waits, and the last fairness waiter is woken (a lost wakeup cost it up to 0.5 s) | queued requests only |
 
+Taken later (2026-11-03 evening, branch local/b54-rb29, to run Unsloth's UD-IQ2_XXS, whose layers 0-9 keep
+ffn_gate/up_exps in IQ1_S):
+
+| upstream | local | what | default path |
+|---|---|---|---|
+| 6fcb780c (#86) | this commit | IQ1_S (19) routed experts: vec_dot_iq1_s_q8_1, Fmt<19>, dq_iq1_s, the block geometry, Split<19> (fork/fork_split.cuh, new here). Upstream's gate/up and down lists live in native_expert_registry.hpp, which this tree does not have: the same X(19) entries went into fork/fork_fmt.cuh's STRATA_GU_FMTS_FORK / STRATA_D_FMTS_FORK. iq_multi_parity.cpp: the IQ1_S cases, without upstream's UD-Q4_K_XL block | IQ1_S files only |
+
 Ported (this tree's own code for an upstream fix; no cherry-pick):
 
 - eb00b1c8 (#106) a turn cut inside a DSML tag sends no DSML text: upstream fixed serve/dsml.py, which came with the
@@ -114,6 +121,7 @@ Skipped:
 - 51a4b712, 57cb32d6, 41190e21: loaders / kernels for other GGUF layouts (llama.cpp's deepseek41, combined Engram and
   DSpark assets, Unsloth's UD-Q2_K_XL IQ3_S downs); this tree runs its own conversions.
 - 8c258be0 (#98) layer split, 14558ac4 + #89 (shared checkpoint payloads), #90, #91, #92, #93, #95, #96, #101, #102,
-  #104, #105, #86 (IQ1_S experts): the layer split, Qwen3.6, MiniMax, Metal, HIP and tokenizer-cache work.
+  #104, #105: the layer split, Qwen3.6, MiniMax, Metal, HIP and tokenizer-cache work.  (#86, IQ1_S experts, was
+  skipped here at first and taken on rb29: see "Taken later" above.)
 - 872f42c0, 148e0623, 2bb0585a .. 4b8daa7e: repairs of the Strata merge.
 - The qwen38 / xol-qfn / LFM3 / voice / README / docs commits, and ddb631bf's opt-in request log (serve; not needed).
