@@ -573,6 +573,16 @@ def _op_feed_ds41(self, delta: str):
 
 
 def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reason=...)
+    # A turn cut (max_tokens, a cancel: a reason other than None / "stop") inside a DSML tag or an unfinished DSML call
+    # sends no DSML text (upstream eb00b1c8, #106, ported to this parser): the held text is only ever a tag that may still
+    # be arriving, and a DSML call is parsed whole, so an unfinished one has no announced part to keep - as content it
+    # reached clients as `<｜DSML｜ invoke name="get_we` / `name="x">\n<｜DSML｜ parameter na` / `</｜DSML｜ call`.
+    # A natural stop keeps it as text, as before.
+    reason = k["reason"] if "reason" in k else (a[0] if a else None)
+    if reason not in (None, "stop"):
+        self.dsml_hold = ""
+        if (self.state in ("call", "json") and not self.bare) or self.state == "content":
+            self.buf = ""
     out = _op_feed(self, _strip_wrappers(self, "", True)) if self.dsml_hold else []
     out = _drop_wrap_echo(self, out + _op_finish(self, *a, **k))
     if self.echo_hold:                 # ended while matching: the whole sentence = the echo, a part of it = real text

@@ -79,7 +79,7 @@ and two pictures; engine pinned/ds41_generate-rb22.exe, sha256 31d3f0fc..., buil
 2,730 commits, but 2,586 of them are upstream Strata's (Niko1221/Strata, 14-31 Oct: the Qwen engines and the shared
 server), which upstream merged in c7a1c73f; Xolotl's own first-parent history is 71 commits (PRs #75-#106).  No rebase
 and no merge of c7a1c73f: nothing in it is for DeepSeek-V4.1, and upstream needed 2bb0585a .. 4b8daa7e, 872f42c0 and
-148e0623 afterwards to make its own DeepSeek / GLM serving work again.  1 taken, the rest deferred or skipped.
+148e0623 afterwards to make its own DeepSeek / GLM serving work again.  1 taken, 1 ported, the rest deferred or skipped.
 
 Taken:
 
@@ -87,11 +87,17 @@ Taken:
 |---|---|---|---|
 | 41edc4e2 (#79) | this commit | serve: a request waiting for the control lines re-checks its turn under slot_cv before it waits, and the last fairness waiter is woken (a lost wakeup cost it up to 0.5 s) | queued requests only |
 
+Ported (this tree's own code for an upstream fix; no cherry-pick):
+
+- eb00b1c8 (#106) a turn cut inside a DSML tag sends no DSML text: upstream fixed serve/dsml.py, which came with the
+  Strata merge; here the DSML parsing is serve_ds41.py's (`_op_finish_ds41`).  With the server's stream_tools=True,
+  a max_tokens / cancel / error cut at 1,176 of 1,308 cut points of one call (steps 1 / 7 / 4096, thinking on and
+  off) sent DSML (`<｜DSML｜ invoke name="get_we`, `name="x">\n<｜DSML｜ parameter na`, `</｜DSML｜ call`) in the
+  answer; now none.  The text before the call stays, a call that was whole before the cut is still returned, and
+  a natural stop keeps a held tag as text.  test_serve_ds41.py's new check fails without the change.
+
 Deferred:
 
-- eb00b1c8 (#106) a turn cut inside a DSML tag sends no DSML text: written for serve/dsml.py, which came with the Strata
-  merge.  The same class of bug is in this tree's serve_ds41.py (`_op_finish_ds41` hands a held `<｜DSML｜ ...` out as
-  content when max_tokens or a cancel ends the turn inside it); it needs its own port.
 - 2788df67 (#88) wake cancelled requests waiting for a native slot, 2d1df99d (#100) a request over the batch slot count
   waits instead of a 503: batch slots (parallel > 1) only; both are written against the post-merge server.py and do not
   apply here.

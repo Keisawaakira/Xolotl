@@ -117,6 +117,31 @@ def t_parser():
             if k != ref_calls or c.strip() != ref["content"].strip() or (thinking and r != ref["reasoning_content"]):
                 bad.append((split, r, c, k))
         check(f"DSML parse == DeepSeek's parser at every split 1..39 (thinking={thinking})", not bad, bad[:1] or ref)
+    # a turn cut (max_tokens / a cancel) anywhere inside the call: no DSML text in the answer, the text before it kept,
+    # a call that was whole before the cut still returned (upstream #106's test, on this parser and the server's
+    # stream_tools=True); a natural stop inside a tag keeps it as text, as before
+    one = "Checking." + dsml([("read_file", {"path": "a.txt", "lines": 3})])
+    bad = []
+    for thinking in (False, True):
+        text = ("plan" + E.thinking_end_token if thinking else "") + one
+        inv_close = f"</{E.dsml_token}{E.tool_call_tag_name}>"
+        whole = text.index(inv_close) + len(inv_close)   # from here on the call is whole
+        for cut in range(text.index("<" + E.dsml_token), len(text)):
+            for step in (1, 7, 4096):
+                p = F.OutputParser(thinking=thinking, tools=TOOLS, stream_tools=True)
+                ev = []
+                for i in range(0, cut, step):
+                    ev += p.feed(text[i:min(i + step, cut)])
+                ev += p.finish("length")
+                content = "".join(e.text for e in ev if e.kind == "content")
+                ncall = sum(e.kind == "tool_call" for e in ev)
+                if content.strip() != "Checking." or (cut >= whole and ncall != 1):
+                    bad.append((thinking, cut, step, content[-40:], ncall))
+    check("a turn cut inside a DSML call sends no DSML text, keeps the text before it and a whole call", not bad, bad[:2])
+    p = F.OutputParser(thinking=False, tools=TOOLS, stream_tools=True)
+    ev = p.feed("ok <｜DSML｜ inv") + p.finish("stop")
+    c = "".join(e.text for e in ev if e.kind == "content")
+    check("a natural stop inside a DSML tag keeps it as text", c == "ok <｜DSML｜ inv", c)
     # plain answer, and text that only looks like a wrapper start
     r, c, k = run_parser("plain answer <｜DSML not a tag", False, 3)
     check("non-DSML text passes through", c == "plain answer <｜DSML not a tag" and not k, (c, k))
