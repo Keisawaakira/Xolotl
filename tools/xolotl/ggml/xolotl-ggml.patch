@@ -2305,3 +2305,117 @@ index ed8554b14..d0383651e 100644
  struct ggml_tensor * ggml_dsv4_hc_pre(
          struct ggml_context * ctx,
          struct ggml_tensor  * x,
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 982a674a..731c96e1 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -384,6 +384,85 @@ static __global__ void mul_mat_vec_f(
+     }
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++// xolotl: GGML_CUDA_MMVF_SPLIT=1 (opt-in, NVIDIA sm_90+): one F32 column against few long rows - DeepSeek-V4.1's hc fns,
++// [20480, 24], 80 calls a token: mul_mat_vec_f gives each row ONE 256-thread block, so 24 SMs read the 1.9 MB (~14 us a
++// call).  Here each warp of that block is a 32-thread block of its own, the row's nwarps blocks one cluster: every lane
++// takes the same columns in the same order (the same FMAs), the same first warp_reduce_sum, and cluster rank 0 does the
++// block's second warp_reduce_sum on the same values (lane w = warp w's sum, the other lanes 0) - the same bits.
++#include <cooperative_groups.h>
++template <int nwarps>
++static __global__ void __launch_bounds__(32) mul_mat_vec_f_split(
++        const float * x_ptr, const float * y_ptr, float * dst, const int ncols2, const int stride_row) {
++#if __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
++    const cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
++    __shared__ float wsum;
++    const int w    = (int) cluster.block_rank();
++    const int row  = blockIdx.x / nwarps;
++    const int lane = threadIdx.x;
++
++    ggml_cuda_pdl_sync();
++    const float2 * x2 = (const float2 *) (x_ptr + int64_t(row)*stride_row);
++    const float2 * y2 = (const float2 *) y_ptr;
++    float sumf = 0.0f;
++#pragma unroll 8
++    for (int col2 = w*32 + lane; col2 < ncols2; col2 += nwarps*32) {
++        const float2 tmpx = x2[col2];
++        const float2 tmpy = y2[col2];
++        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
++        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
++    }
++    ggml_cuda_pdl_lc();
++    sumf = warp_reduce_sum<32>(sumf);
++    if (lane == 0) {
++        wsum = sumf;
++    }
++    cluster.sync();
++    if (w == 0) {
++        float v = lane < nwarps ? *cluster.map_shared_rank(&wsum, lane) : 0.0f;
++        v = warp_reduce_sum<32>(v);
++        if (lane == 0) {
++            dst[row] = v;
++        }
++    }
++    cluster.sync();   // the other blocks' shared memory stays until rank 0 has read it
++#else
++    GGML_UNUSED_VARS(x_ptr, y_ptr, dst, ncols2, stride_row);
++    NO_DEVICE_CODE;
++#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
++}
++
++template <int nwarps>
++static void mul_mat_vec_f_split_launch(const float * x, const float * y, float * dst, const int ncols2, const int stride_row,
++                                       const int nrows, cudaStream_t stream) {
++    cudaLaunchAttribute attr[2];
++    attr[0].id = cudaLaunchAttributeClusterDimension;
++    attr[0].val.clusterDim.x = nwarps;
++    attr[0].val.clusterDim.y = 1;
++    attr[0].val.clusterDim.z = 1;
++    unsigned int na = 1;
++#if defined(GGML_CUDA_USE_PDL)
++    static const bool pdl = [] {
++        const char * env = getenv("GGML_CUDA_PDL");
++        return env == nullptr || std::atoi(env) != 0;
++    }();
++    if (pdl) {
++        attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++        attr[1].val.programmaticStreamSerializationAllowed = 1;
++        na = 2;
++    }
++#endif // defined(GGML_CUDA_USE_PDL)
++    cudaLaunchConfig_t cfg = {};
++    cfg.gridDim          = dim3(nrows*nwarps, 1, 1);
++    cfg.blockDim         = dim3(32, 1, 1);
++    cfg.dynamicSmemBytes = 0;
++    cfg.stream           = stream;
++    cfg.attrs            = attr;
++    cfg.numAttrs         = na;
++    CUDA_CHECK(cudaLaunchKernelEx(&cfg, mul_mat_vec_f_split<nwarps>, x, y, dst, ncols2, stride_row));
++}
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
+ template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
+ static void mul_mat_vec_f_switch_fusion(
+         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+@@ -452,6 +531,23 @@ void launch_mul_mat_vec_f_cuda(
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    // xolotl: GGML_CUDA_MMVF_SPLIT=1 - mul_mat_vec_f_split, where a row's one block would leave most SMs idle
++    if constexpr (std::is_same_v<T, float> && ncols_dst == 1 && !is_multi_token_id) {
++        static const bool split = [] {
++            const char * env = getenv("GGML_CUDA_MMVF_SPLIT");
++            return env != nullptr && std::atoi(env) != 0;
++        }();
++        const int cc = ggml_cuda_info().devices[device].cc;
++        if (split && ids == nullptr && !has_fusion && block_size_best == 256 && nchannels_dst == 1 && nsamples_or_ntokens == 1 &&
++            GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER && ncols >= 4096 &&
++            2*nrows <= ggml_cuda_info().devices[device].nsm) {
++            mul_mat_vec_f_split_launch<8>(x, y, dst, (int) (ncols/2), (int) stride_row, (int) nrows, stream);
++            return;
++        }
++    }
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
+     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(block_size_best, 1, 1);
