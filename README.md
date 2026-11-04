@@ -6,6 +6,16 @@
 Plus GLM-5.3-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B: one engine, one OpenAI / Anthropic-compatible server.<br>
 Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily extended · Linux · NVIDIA · MIT</p>
 
+> **This fork: DeepSeek-V4.1-Flash-1017 on Windows with one RTX 5090 + 64 GB RAM.**
+> - **Models:** ISTA-DASLab's GSQ-RCO IQ2_XS or Unsloth's UD-IQ2_XXS.
+> - **Features:** 1M context, image input, the same OpenAI / Anthropic server.
+> - **Speed, GSQ IQ2_XS:** short-chat decode 81 tok/s with the default fast routing (39 tok/s exact); a fresh 128K
+>   prompt at 2,160 tok/s.
+> - **Speed, UD-IQ2_XXS:** 71 / 36 tok/s, closer to the original model.
+> - **Setup, the configs this PC runs, and all measurements:**
+>   [docs/WINDOWS_RTX5090.md](docs/WINDOWS_RTX5090.md).
+> - **Base:** upstream Xolotl at `03a138f8` (2026-10-26) plus 55 commits.
+
 > **A Strata fork.** Xolotl keeps [Strata](https://github.com/Niko1221/Strata)'s engine, server and kernels at its
 > core (merged at 0.1.44.1) and adds ~71,000 lines on top: the DeepSeek-V4.1 and V4-Flash engines, the GLM-5.3-Flash
 > engine and the Qwen3.8-27B dense port, each with its own quantisation and expert-tiering work.
